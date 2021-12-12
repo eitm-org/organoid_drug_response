@@ -1,0 +1,680 @@
+---
+title: "Imaging-Based Machine Learning Analysis of Patient-Derived Tumor Organoid Drug Response"
+author: "Nolan Ung, Naim Matasci"
+date: "12/11/2021"
+always_allow_html: yes
+output:
+  html_document:
+    highligh: haddock
+    keep_md: yes
+    number_sections: yes
+    theme: paper
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+  html_notebook:
+    highligh: haddock
+    number_sections: yes
+    theme: paper
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+  pdf_document: default
+---
+
+
+Run on `r date()`
+
+# Setup
+```{r setup, include=FALSE}
+if (dev.cur() != 1) {
+  dev.off()
+}
+knitr::opts_chunk$set(echo = TRUE)
+source("functions.R")
+library(irr)
+library(ggridges)
+library(eulerr)
+library(cowplot)
+input_folder <- file.path(here::here(), "data")
+```
+
+# Plotting options
+```{r global_plotting_opts, include=FALSE}
+Compound_cols <- c(
+  Media = "#000000",
+  OXA = "#265DAB",
+  IRI = "#059748",
+  STA = "#DF5C24"
+)
+# Live always correspond to few_pal()(2)[1]== "#5DA5DA" and dead to few_pal()(2)[1]=="#FAA43A"
+LD_cols <- c(Live = "#5DA5DA", Dead = "#FAA43A")
+
+Patient_cols <- c(
+  `12415` = "yellow3",
+  `12527` = "turquoise1",
+  `12620` = "tomato",
+  `12737` = "purple",
+  `12911` = "blue",
+  `13154` = "chartreuse4",
+  `12620_A` = "tomato",
+  `12620_B` = "dodgerblue",
+  `12415_A` = "yellow3",
+  `12415_B` = "orange"
+)
+Day_col <- c("0" = "#CCCCCC", "1" = "#ABABAB", "3" = "#818181", "7" = "#333333")
+```
+
+# Load input
+```{r load_input, echo=TRUE, include=FALSE}
+# Load and consolidated input
+big_tbl <- read_csv(file.path(here(), "data", "consolidated.csv"))
+big_tbl <- big_tbl %>% mutate(
+  Compound = as.factor(Compound),
+  Concentration = ordered(Concentration),
+  `Cell Type` = as.factor(`Cell Type`),
+  Day = as.integer(Day)
+)
+# GT Organoid classification by experts
+org_class <- read_csv(file.path(input_folder, "ground_truth", "Organoid_Classification_Responses.csv"))
+
+
+# GT Vital Dye measurements
+gt_i <- import_wb(file.path(input_folder, "ground_truth", "20171010_20171017_12620_GT.xlsx"))
+gt_i <- gt_i %>% mutate(UID = paste(Row, Column, Field, `Object No in Organoids`, Day, sep = "."))
+
+# GT Imaging measurements
+gt_n <- import_wb(file.path(input_folder, "ground_truth", "20171010_20171017_12620_GT_DRAQ7.xlsx"))
+gt_n <- gt_n %>% mutate(UID = paste(Row, Column, Field, `(DRAQ7) - Object No in Organoids`, Day, sep = "."))
+
+# Tracked organoids
+tracked_organoids <- read.csv(file.path(input_folder, "ground_truth", "20180122_13154_GT_Tracked-Nulcei_INT.csv"),
+  stringsAsFactors = FALSE,
+  encoding = "latin1"
+)
+
+# DRAQ7 comparison
+DRAQ7_data <- read_csv(file.path(input_folder, "ground_truth", "DRAQ7.csv")) %>% mutate(Compound = ifelse(Compound == "media", "Media", Compound))
+```
+
+
+# Fig 2A - Heatmap of organoids in media
+```{r orgs_media_hm, echo=FALSE, message=FALSE, warning=FALSE, fig.height=7.5, fig.width=7.5}
+metrics <- c("Region Area [µm²]", "Region Roundness", "Region Ratio Width to Length", "Region Symmetry 02", "Region Symmetry 03", "Region Symmetry 04", "Region Symmetry 05", "Region Symmetry 12", "Region Symmetry 13", "Region Symmetry 14", "Region Symmetry 15", "Region Threshold Compactness 30%", "Region Threshold Compactness 40%", "Region Threshold Compactness 50%", "Region Threshold Compactness 60%", "Region Axial Small Length", "Region Axial Length Ratio", "Region Radial Mean", "Region Radial Relative Deviation", "Region Profile 1/2", "Region Profile 2/2", "Region Brightfield SER Edge 1 px", "Region Brightfield SER Ridge 1 px", "Region Brightfield SER Valley 1 px", "Region Brightfield SER Dark 1 px")
+identifiers <- c("Row", "Column", "Field", "Compound", "Concentration", "Cell Type", "ExpID")
+
+identifiers <- identifiers[identifiers != "Field"]
+# By well
+table_of_means_L <- big_tbl %>%
+  dplyr::filter(Day == 3, Compound == "Media", LD == "Live") %>%
+  select(c(identifiers, metrics)) %>%
+  group_by_at(identifiers) %>%
+  summarise(across(metrics, mean)) %>%
+  mutate(GUID = paste(Row, Column, `Cell Type`, Compound, sep = "_")) %>%
+  ungroup() %>%
+  select(-identifiers[!identifiers %in% c("Compound", "Cell Type")]) %>%
+  arrange(`Cell Type`, GUID)
+
+table_of_means_D <- big_tbl %>%
+  dplyr::filter(Day == 3, Compound == "STA", LD == "Dead") %>%
+  select(c(identifiers, metrics)) %>%
+  group_by_at(identifiers) %>%
+  summarise(across(metrics, mean)) %>%
+  mutate(GUID = paste(Row, Column, `Cell Type`, Compound, sep = "_")) %>%
+  ungroup() %>%
+  select(-identifiers[!identifiers %in% c("Compound", "Cell Type")]) %>%
+  arrange(`Cell Type`, GUID)
+
+table_of_means <- table_of_means_L
+
+pat_annot <- as.data.frame(bind_cols(
+  GUID = table_of_means$GUID, Patient = as.character(table_of_means$`Cell Type`),
+  Treatment = as.character(table_of_means$Compound)
+))
+rownames(pat_annot) <- pat_annot$GUID
+GUIDs <- table_of_means$GUID
+mat_of_means <- table_of_means %>%
+  select(-`Cell Type`, -GUID, -Compound) %>%
+  t()
+rownames(mat_of_means) <- rownames(mat_of_means) %>% str_replace("Region ", "")
+colnames(mat_of_means) <- GUIDs
+if (all(pat_annot$Treatment %>% unique() == "Media")) {
+  keep_labels <- seq(2, 18, by = 3)
+  pat_labels <- rep("", nrow(pat_annot))
+  pat_labels[keep_labels] <- pat_annot$Patient[keep_labels]
+  pt_gaps <- seq(3, 17, by = 3)
+} else if (all(pat_annot$Treatment %>% unique() == "STA")) {
+  keep_labels <- seq(2, 18, by = 3)
+  pat_labels <- rep("", nrow(pat_annot))
+  pat_labels[keep_labels] <- pat_annot$Patient[keep_labels]
+  pt_gaps <- seq(3, 17, by = 3)
+} else {
+  keep_labels <- seq(3, nrow(pat_annot), by = 6)
+  pat_labels <- rep("", nrow(pat_annot))
+  pat_labels[keep_labels] <- pat_annot$Patient[keep_labels]
+  pt_gaps <- seq(6, nrow(pat_annot), by = 6)
+}
+
+
+po <- pheatmap(
+  mat = mat_of_means,
+  scale = "row",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  border_color = NA,
+  annotation_col = NULL,
+  annotation_colors = ann_colors,
+  main = "",
+  show_colnames = TRUE,
+  labels_col = pat_labels,
+  gaps_col = pt_gaps,
+  color = viridis(32)
+)
+```
+
+
+# Fig 3A - Expert Ground Truth
+```{r Expert_ground_truth, echo=FALSE, message=FALSE,  warning=FALSE, fig.height=5, fig.width=5, echo=FALSE}
+# melt and make variables factors
+org_melt <-
+  org_class %>% melt(id.vars = c("Timestamp", "Email Address", "Group"))
+
+org_melt$Group <-
+  ordered(
+    org_melt$Group,
+    levels = c("experimental", "Harmony", "DRAQ7"),
+    labels = c("Experts", "Harmony", "DRAQ7")
+  )
+
+
+names(org_class) <-
+  make.names(names = names(org_class)) %>% str_replace_all(pattern = "^.*\\.\\.|X\\.|\\.$", replacement = "")
+
+majority <-
+  lapply(org_class, function(x) {
+    names(which.max(table(x)))
+  }) %>%
+  as.data.frame() %>%
+  mutate(Email.Address = "Majority@stat.com", Group = "Majority")
+
+melt_major <-
+  org_class %>%
+  full_join(majority) %>%
+  melt(id.vars = c("Timestamp", "Email.Address", "Group"))
+melt_major$Group <-
+  ordered(
+    melt_major$Group,
+    levels = c("experimental", "Majority", "Harmony", "DRAQ7"),
+    labels = c("Experts", "Majority", "ML", "DRAQ7")
+  )
+
+melt_major$variable <- factor(
+  melt_major$variable,
+  levels = c(
+    "A.15",
+    "A.19",
+    "C.41",
+    "D.48",
+    "F.29",
+    "A.22",
+    "A.17",
+    "B.44",
+    "E.49",
+    "C.8",
+    "D.82",
+    "F.53",
+    "D.12",
+    "B.22",
+    "E.82",
+    "C.43",
+    "F.59",
+    "E.12"
+  ),
+  labels = c(
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18"
+  )
+)
+
+
+G <- ggp(melt_major, aes(x = variable, fill = value))
+G + geom_bar(
+  stat = "count",
+  position = "stack",
+  width = .95
+) +
+  labs(title = "Expert Ground Truth for Organoid Viability", x = "Organoid ID") + facet_grid(Group ~
+  ., scales = "free_y") +
+  geom_hline(
+    data = data.frame(yint = 4.5, Group = "Experts"),
+    aes(yintercept = yint),
+    linetype = "solid",
+    color = "black"
+  ) +
+  theme(legend.title = element_blank()) + scale_y_continuous(breaks = c(1, 3, 5, 7, 9)) +
+  scale_fill_manual(values = rev(few_pal()(2)))
+
+# Compute Fleiss Kappa
+fleiss_class <- org_class %>%
+  filter(Group == "experimental") %>%
+  dplyr::select(-Timestamp, -Group) %>%
+  column_to_rownames("Email.Address") %>%
+  t() %>%
+  as.tibble()
+
+kappam.fleiss(fleiss_class, detail = TRUE)
+```
+
+# Fig 3C - Comparison between VitalDye and ML
+```{r comp_ML_VD, echo=FALSE, message=FALSE,  warning=FALSE, fig.height=5, fig.width=7}
+# Remove cases where multiple objects map to the same organoid in image
+en_b <- nrow(gt_n)
+gt_n <- gt_n %>%
+  group_by(UID) %>%
+  filter(n() == 1)
+
+if ((en_b - nrow(gt_n)) > 0) {
+  warning(paste("Removed", removed, "duplicate entries out of", en_b, "total"))
+}
+
+n_suffix <- "_VD"
+i_suffix <- "_Imaging"
+
+gt_r <- unify(gt_n, gt_i, n_suffix, i_suffix)
+gt_r <- restack(gt_r, "LD", n_suffix, i_suffix)
+
+subdata <- subset_measurements(gt_r, "counts")
+nuc_counts <- normalize_data(subdata, metric = "proportion")
+cm <- matrix(unlist(strsplit(nuc_counts$Compound, "_")), ncol = 2, byrow = T)
+nuc_counts$Compound <- cm[, 1]
+nuc_counts$Assay <- cm[, 2]
+nuc_counts[nuc_counts$Compound == "media", "Compound"] <- "Media"
+nuc_counts[nuc_counts$Assay == "Imaging", "Assay"] <- "ML"
+nuc_counts[nuc_counts$Assay == "VD", "Assay"] <- "DRAQ7"
+nuc_counts$Assay <- ordered(nuc_counts$Assay, levels = c("ML", "DRAQ7"))
+
+i_aes <- list(cols = c("black", "black", "red", "red"), shapes = c(0, 0, 1, 1), lines = c(0, 0, 3, 3))
+
+plot(plot_c_curves(nuc_counts, "", patient = NULL, error_bars = T, normalized = F, metric = "proportion") + theme(axis.text = element_text(size = 15)))
+```
+
+
+# Fig 3D - Agreement with vital dye
+```{r draq7, echo=FALSE, message=FALSE,  warning=FALSE, fig.height=5, fig.width=7}
+
+draq7_comp <- DRAQ7_data %>%
+  ungroup() %>%
+  select("Row", "Column", "Timepoint", "Compound", dye_status, ML_status) %>%
+  group_by(Timepoint, Compound) %>%
+  get_irr() %>%
+  mutate(Well = paste0(Row, Column))
+
+draq7_comp_avg <- draq7_comp %>%
+  ungroup() %>%
+  select("Timepoint", "Compound", "agree_val") %>%
+  group_by(Timepoint, Compound) %>%
+  summarise(agreement = mean(agree_val), sd = sd(agree_val), obs = sum(!is.na(agree_val)), se = sd / sqrt(obs)) %>%
+  mutate(Day = Timepoint / 24)
+
+pd <- position_dodge(.1)
+
+
+ggplot(data = draq7_comp_avg) +
+  aes(x = Day, y = agreement, col = Compound) +
+  geom_errorbar(aes(ymin = agreement - sd, ymax = agreement + sd), width = .5, position = pd) +
+  geom_line(lwd = 1) +
+  geom_point(position = pd) +
+  scale_x_continuous(breaks = draq7_comp_avg$Day) +
+  scale_color_manual(values = c(
+    Media = "#000000",
+    STA = "#DF5C24"
+  )) +
+  theme_linedraw() +
+  ylab("Percentage agreement")
+```
+
+# Fig 3E - Vital status over time
+```{r vital_status_time_hm, echo=FALSE, message=FALSE,  warning=FALSE,width=5, height=5.5}
+# rename and select important columns and create unique ID
+sub_organoids <- tracked_organoids %>%
+  rename(
+    harmony_live = Tracked.Organoids.Selected.Selected...Live,
+    harmony_dead = Tracked.Organoids.Selected.Selected...Dead,
+    DRAQ_live_perObject = Tracked.Organoids.Selected.Selected...Number.of.Nuclei..DRAQ7....per.Object,
+    DRAQ_dead = Tracked.Organoids.Selected.Selected...Dead..DRAQ7..,
+    DRAQ_live = Tracked.Organoids.Selected.Selected...Live..DRAQ7..,
+    DRAQ_INT = Tracked.Organoids.Selected.Selected...Intensity.Nucleus.Mean.Smoothed.Mean
+  ) %>%
+  dplyr::select(-starts_with("Tracked")) %>%
+  mutate(unique_ID = paste(Row, Column, Field, Object.ID, sep = "_")) %>%
+  mutate(Time..s. = round((((Time..s. / 60) / 60) / 24))) %>%
+  dplyr::select(-Timepoint) %>%
+  rename(Timepoint = Time..s.)
+
+# filter for organoids that are tracked across all timepoints
+surv_organoids <- sub_organoids %>%
+  group_by(Row, Column, Field, Compound, Object.ID) %>%
+  dplyr::summarise(count = n()) %>%
+  filter(count >= 5)
+
+# create a survival status column and label each organoid based on its L or dead call in harmony or by DRAQ
+surv_organoids_only <- inner_join(sub_organoids, surv_organoids) %>% mutate(surv_status = 0)
+surv_organoids_only$surv_status[surv_organoids_only$harmony_live == 1 & surv_organoids_only$DRAQ_live == 1] <- "L-ML_L-VD"
+surv_organoids_only$surv_status[surv_organoids_only$harmony_live == 1 & surv_organoids_only$DRAQ_live == 0] <- "L-ML_D-VD"
+surv_organoids_only$surv_status[surv_organoids_only$harmony_live == 0 & surv_organoids_only$DRAQ_live == 1] <- "D-ML_L-VD"
+surv_organoids_only$surv_status[surv_organoids_only$harmony_live == 0 & surv_organoids_only$DRAQ_live == 0] <- "D-ML_D-VD"
+
+rorder <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint != 2) %>%
+  group_by(unique_ID) %>%
+  mutate(gindex = cur_group_id()) %>%
+  pivot_wider(id_cols = gindex, names_from = Timepoint, values_from = harmony_live) %>%
+  mutate(v_state = paste0(`0`, `1`, `3`, `7`)) %>%
+  arrange(v_state) %>%
+  pull(gindex)
+
+rrank <- seq_len(length(rorder))
+names(rrank) <- rorder
+
+surv_organoids_sta <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint != 2) %>%
+  group_by(unique_ID) %>%
+  mutate(gindex = cur_group_id(), grank = rrank[as.character(gindex)]) %>%
+  ungroup() %>%
+  mutate(`Vital status` = ifelse(harmony_live == 1, "Live", "Dead"))
+
+ggplot(surv_organoids_sta) +
+  aes(x = as.factor(Timepoint), y = grank) +
+  geom_tile(aes(fill = ordered(`Vital status`, levels = c("Live", "Dead"))), width = .99, height = 1, color = "gray50") +
+  xlab("Day") +
+  ylab("Individual Organoids") +
+  scale_fill_few("Medium", name = "Vital status") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 18)
+  )
+```
+
+# Fig 4A - Dead PDO Features
+```{r, message=FALSE, echo=FALSE, warning=FALSE,  fig.height=5, fig.width=7}
+drug_ann_colors <- list(Compound = Compound_cols, Day = Day_col[-1])
+
+drug_tbl <- big_tbl %>%
+  melt(id.vars = c("Display", "Row", "Compound", "Concentration", "Cell Type", "LD", "Day", "ExpID")) %>%
+  filter(grepl("Region|Object", variable)) %>%
+  filter((Compound == "OXA" & Concentration == 20) | (Compound == "IRI" & Concentration %in% c(20)) | Compound == "Media" | Compound == "STA" | Compound == "STA 5", Day != 0)
+
+drug_tbl_clean <- fix_vars2(drug_tbl)
+
+drug_l_12415 <- make_map_pdcc_ld(drug_tbl_clean %>% filter(ExpID %in% c("20181109_20161025_1107_12415", "20171012_12415_OXA_2016905_0913")), "Dead")
+
+
+pheatmap(
+  mat = drug_l_12415$mat,
+  color = viridis(100),
+  fontsize = 14,
+  labels_col = "",
+  scale = "none",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  border_color = "light grey",
+  annotation_col = drug_l_12415$annot %>% select(-Patient) %>% mutate(Day = as.factor(Day)),
+  annotation_colors = drug_ann_colors,
+  main = "12415 Dead Only"
+)
+
+
+
+
+drug_l_12527 <- make_map_pdcc_ld(drug_tbl_clean %>% filter(ExpID %in% c("20171012_12527_20161206_1213")), "Dead")
+
+pheatmap(
+  mat = drug_l_12527$mat,
+  color = viridis(100),
+  fontsize = 14,
+  labels_col = "",
+  scale = "none",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  border_color = "light grey",
+  annotation_col = drug_l_12527$annot %>% select(-Patient) %>% mutate(Day = as.factor(Day)),
+  annotation_colors = drug_ann_colors,
+  main = "12527 Dead Only"
+)
+
+drug_l_12911 <- make_map_pdcc_ld(drug_tbl_clean %>% filter(ExpID %in% c("20171016_12911_CRC_20170314_0321")), "Dead")
+
+pheatmap(
+  mat = drug_l_12911$mat,
+  color = viridis(100),
+  fontsize = 14,
+  labels_col = "",
+  scale = "none",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  border_color = "light grey",
+  annotation_col = drug_l_12911$annot %>% select(-Patient) %>% mutate(Day = as.factor(Day)),
+  annotation_colors = drug_ann_colors,
+  main = "12911 Dead Only"
+)
+```
+
+# Fig 4B, 4C - Response curves and feature boxplots
+```{r load_data, message=FALSE, echo=FALSE, warning=FALSE,  fig.height=5, fig.width=7}
+feature <- "counts"
+subdata <- subset_measurements(big_tbl, feature = feature, missing_as_zero = TRUE)
+subdata <- make_treatments(subdata)
+
+
+
+subdata <- subdata %>% dplyr::filter(
+  (Compound == "IRI" & Concentration == 20) |
+    (Compound == "IRI" & Concentration == 40) |
+    (Compound == "OXA" & Concentration == 20) |
+    (Compound == "STA") |
+    (Compound == "Media")
+)
+
+norm_counts <- normalize_data(subdata)
+
+plot(plot_curves(norm_counts %>% filter(`Cell Type` == 12415) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Primary)")), pat = "12415", feature = feature, error_bars = T, normalized = T, metric = "proportion"))
+
+
+plot(plot_curves(norm_counts %>% filter(`Cell Type` == 12527) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Metastasis)")), pat = "12527", feature = feature, error_bars = T, normalized = T, metric = "proportion"))
+
+plot(plot_curves(norm_counts %>% filter(`Cell Type` == 12911) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Primary)")), pat = "12911", feature = feature, error_bars = T, normalized = T, metric = "proportion"))
+
+rt60_meas <- "Region Threshold Compactness 60%"
+rt60 <- subset_measurements(big_tbl, feature = rt60_meas, missing_as_zero = FALSE) %>% dplyr::filter(
+  (Compound == "IRI" & Concentration == 20) |
+    (Compound == "IRI" & Concentration == 40) |
+    (Compound == "OXA" & Concentration == 20) |
+    (Compound == "STA") |
+    (Compound == "Media")
+)
+rt60_norm <- normalize_data(rt60)
+plot(plot_boxes(rt60 %>% filter(`Cell Type` == 12415) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Primary)")), pat = "12415 (Primary)", feature = rt60_meas))
+plot(plot_boxes(rt60 %>% filter(`Cell Type` == 12527) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Primary)")), pat = "12527 (Metastasis)", feature = rt60_meas))
+plot(plot_boxes(rt60 %>% filter(`Cell Type` == 12911) %>% ungroup() %>% mutate(`Cell Type` = paste(`Cell Type`, "(Primary)")), pat = "12911 (Primary)", feature = rt60_meas))
+```
+
+# Supplemental Fig 2 - Distribution of features across patients (Day 3, STA treated and Media)
+```{r ridges, echo=FALSE, message=FALSE, warning=FALSE, fig.height=13, fig.width=16 }
+metrics <- c("Region Area [µm²]", "Region Roundness", "Region Ratio Width to Length", "Region Symmetry 02", "Region Symmetry 03", "Region Symmetry 04", "Region Symmetry 05", "Region Symmetry 12", "Region Symmetry 13", "Region Symmetry 14", "Region Symmetry 15", "Region Threshold Compactness 30%", "Region Threshold Compactness 40%", "Region Threshold Compactness 50%", "Region Threshold Compactness 60%", "Region Axial Small Length", "Region Axial Length Ratio", "Region Radial Mean", "Region Radial Relative Deviation", "Region Profile 1/2", "Region Profile 2/2", "Region Brightfield SER Edge 1 px", "Region Brightfield SER Ridge 1 px", "Region Brightfield SER Valley 1 px", "Region Brightfield SER Dark 1 px")
+big_tbl_mlt_norm <- big_tbl %>%
+  mutate_at(metrics, ~ (scale(.) %>% as.vector())) %>%
+  filter(Day == 3) %>%
+  mutate(Row = paste(Row, ExpID, sep = "_")) %>%
+  reshape2::melt() %>%
+  filter(grepl("Region|Object", variable)) %>%
+  filter(Compound == "Media" | Compound == "STA") %>%
+  mutate(variable = str_replace_all(variable, pattern = "Region.", replacement = "")) %>%
+  fix_vars2()
+
+ggplot(big_tbl_mlt_norm) +
+  aes(x = value, y = Patient, fill = Patient, color = Compound, lty = Compound) +
+  geom_density_ridges(alpha = .2) +
+  facet_wrap(~variable, scales = "free") +
+  scale_fill_manual(values = Patient_cols[1:6]) +
+  ylab(NULL) +
+  theme(axis.text.x = element_blank(), ) +
+  xlab(NULL) +
+  scale_color_manual(values = Compound_cols[c("Media", "STA")]) +
+  labs(color = "Compound", linetype = "Compound")
+```
+
+# Supplemental Fig 3 - Organoids in media clustered by day
+```{r fig2_b, echo=FALSE, message=FALSE, warning=FALSE, fig.height=11, fig.width=14}
+ann_colors <- list(
+  LD = LD_cols,
+  Compound = Compound_cols[c("Media", "STA")],
+  Patient = Patient_cols[c("12415", "12527", "12620", "12737", "12911", "13154")],
+  Day = Day_col
+)
+
+mlt_big_tbl_media <- big_tbl %>%
+  melt(
+    id.vars = c(
+      "Display",
+      "Row",
+      "Compound",
+      "Concentration",
+      "Cell Type",
+      "LD",
+      "Day",
+      "ExpID"
+    )
+  ) %>%
+  filter(grepl("Region|Object", variable)) %>%
+  filter(Compound == "Media", Day != "2")
+
+map_media_l <- make_map_pdr(fix_vars2(mlt_big_tbl_media))
+
+pheatmap(
+  mat = map_media_l$mat,
+  scale = "row",
+  cluster_rows = TRUE,
+  border_color = NA,
+  annotation_col = map_media_l$annot %>% mutate(Day = as.factor(Day)),
+  annotation_colors = ann_colors,
+  main = "",
+  show_colnames = FALSE,
+  color = viridis(32),
+  treeheight_row = 0
+)
+```
+
+
+# Supplemental Fig 5b - Venn Diags
+```{r vennPlots,echo=FALSE, message=FALSE, warning=FALSE, fig.height=7, fig.width=9 }
+surv_organoids_only <- surv_organoids_only %>% mutate(ML = harmony_live, VD = DRAQ_live)
+p0_m_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 0) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p1_m_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 1) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p3_m_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 3) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p7_m_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 7) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p0_sta_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 0) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p1_sta_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 1) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p3_sta_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 3) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p7_sta_l <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 7) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+
+
+surv_organoids_only <- surv_organoids_only %>% mutate(ML = harmony_dead, VD = DRAQ_dead)
+p0_m_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 0) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p1_m_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 1) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p3_m_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 3) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p7_m_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "Media", Timepoint == 7) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p0_sta_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 0) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p1_sta_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 1) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p3_sta_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 3) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+p7_sta_d <- surv_organoids_only %>%
+  dplyr::filter(Compound == "STA", Timepoint == 7) %>%
+  select(ML, VD) %>%
+  euler() %>%
+  plot(quantities = TRUE, c("orangered4", "magenta4", "cornsilk4"), alpha = .6)
+plot_grid(p0_m_l, p0_m_d, p1_m_l, p1_m_d, p3_m_l, p3_m_d, p7_m_l, p7_m_d, ncol = 2)
+plot_grid(p0_sta_l, p0_sta_d, p1_sta_l, p1_sta_d, p3_sta_l, p3_sta_d, p7_sta_l, p7_sta_d, ncol = 2)
+```
